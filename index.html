@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0c0e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Pulsar TK</title>
+<!--
+  Pulsar Devices task keeper: phone app (prototype).
+
+  A single page that talks to the device over Bluetooth with Web Bluetooth.
+  iPhone Safari has no Web Bluetooth, so open it in the free Bluefy browser.
+  Add ?mock to the address to try it without a device (any browser).
+
+  It uses the same text commands as nRF Connect (docs/BLUETOOTH.md):
+  TASKS to read the list, ADD / DEL to change it, BATT, BEEP.
+  Kept dependency-free so the logic can move to a native app later.
+-->
+<style>
+  :root {
+    --bg: #0b0c0e;
+    --panel: #141518;
+    --line: #23252a;
+    --text: #d9d9d5;
+    --soft: #9b9b98;
+    --dim: #67676a;
+    --beam: #96c3ff;      /* the pulsar's blue, as on the device */
+    --core: #ebf5ff;
+    --danger: #e58b7d;
+    --radius: 14px;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.4 var(--sans);
+    min-height: 100vh;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; padding: 16px 16px 120px; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+
+  /* ---- header ---- */
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 0 20px; }
+  .pulsar { position: relative; width: 14px; height: 14px; flex: none; }
+  .pulsar::before, .pulsar::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+  }
+  .pulsar::before { background: var(--core); box-shadow: 0 0 10px 2px var(--beam); }
+  .pulsar::after { border: 1px solid var(--beam); animation: ping 2.4s ease-out infinite; }
+  .off .pulsar::before { background: var(--dim); box-shadow: none; }
+  .off .pulsar::after { animation: none; border-color: transparent; }
+  @keyframes ping { from { transform: scale(1); opacity: .9; } to { transform: scale(3.2); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .pulsar::after { animation: none; } }
+  .brand { font-family: var(--mono); letter-spacing: .14em; font-size: 13px; color: var(--soft); }
+  .status { margin-left: auto; font-size: 13px; color: var(--dim); text-align: right; }
+
+  /* ---- connect ---- */
+  .hero { text-align: center; padding: 18vh 8px 0; }
+  .hero h1 { font-weight: 500; font-size: 22px; margin: 0 0 8px; }
+  .hero p { color: var(--soft); margin: 0 0 28px; }
+  .primary {
+    background: var(--core); color: #0b0c0e; border: 0; border-radius: 999px;
+    padding: 14px 28px; font-weight: 600;
+  }
+  .primary:disabled { opacity: .5; }
+  .ghost {
+    background: transparent; border: 1px solid var(--line); border-radius: 999px;
+    padding: 10px 16px; color: var(--soft); font-size: 14px;
+  }
+  .note { color: var(--dim); font-size: 13px; margin-top: 20px; }
+
+  /* ---- next task ---- */
+  .label { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--dim); margin: 0 0 8px; }
+  .next {
+    background: radial-gradient(120% 140% at 0% 100%, rgba(150,195,255,.12), transparent 60%), var(--panel);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 28px;
+  }
+  .next .when { font-family: var(--mono); color: var(--beam); font-size: 14px; }
+  .next .title { font-size: 22px; margin: 4px 0 2px; color: var(--core); word-break: break-word; }
+  .next .brief { color: var(--soft); word-break: break-word; }
+  .next.empty .title { color: var(--soft); font-size: 18px; }
+
+  /* ---- list ---- */
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: flex; gap: 12px; align-items: flex-start;
+    padding: 14px 0; border-bottom: 1px solid var(--line);
+  }
+  li .when { font-family: var(--mono); font-size: 13px; color: var(--soft); width: 92px; flex: none; padding-top: 2px; }
+  li .when .day { display: block; color: var(--dim); font-size: 11px; }
+  li .body { flex: 1; min-width: 0; }
+  li .title { word-break: break-word; }
+  li .brief { color: var(--soft); font-size: 14px; word-break: break-word; }
+  .del {
+    flex: none; background: transparent; border: 1px solid #33363d; border-radius: 999px;
+    padding: 6px 12px; font-size: 13px; color: var(--soft);
+  }
+  .del.confirm { border-color: var(--danger); color: var(--danger); }
+  li.past .title { color: var(--soft); }
+
+  /* ---- bottom bar ---- */
+  .bar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, var(--bg) 30%);
+  }
+  .bar .inner { max-width: 560px; margin: 0 auto; display: flex; gap: 8px; align-items: center; }
+  .bar .primary { margin-left: auto; }
+  .chip { font-family: var(--mono); font-size: 12px; color: var(--soft); }
+
+  /* ---- add sheet ---- */
+  .sheet-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; display: none;
+    background: var(--panel); border-top: 1px solid var(--line);
+    border-radius: 18px 18px 0 0; padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+  }
+  .sheet .inner { max-width: 560px; margin: 0 auto; }
+  .open .sheet, .open .sheet-bg { display: block; }
+  .sheet h2 { font-size: 17px; font-weight: 600; margin: 0 0 16px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: flex; justify-content: space-between; font-size: 13px; color: var(--soft); margin-bottom: 6px; }
+  .field .count { font-family: var(--mono); color: var(--dim); }
+  .field .count.full { color: var(--beam); }
+  input, textarea {
+    width: 100%; font: 16px var(--sans); color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--beam); }
+  textarea { resize: none; height: 72px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; min-width: 0; }
+  input[type=date], input[type=time] { color-scheme: dark; }
+  .quick { display: flex; gap: 6px; flex-wrap: wrap; margin: -4px 0 16px; }
+  .quick button { font-size: 13px; padding: 6px 12px; }
+  .sheet .actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .error { color: var(--danger); font-size: 14px; min-height: 20px; margin: 0 0 8px; }
+
+  /* ---- toast ---- */
+  .toast {
+    position: fixed; left: 50%; bottom: calc(84px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 10px 16px; font-size: 14px; color: var(--text); opacity: 0; transition: opacity .2s;
+    pointer-events: none; max-width: calc(100% - 32px); text-align: center;
+  }
+  .toast.show { opacity: 1; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap off" id="app">
+  <header>
+    <div class="pulsar" aria-hidden="true"></div>
+    <div class="brand">PULSAR TK</div>
+    <div class="status" id="status">Not connected</div>
+  </header>
+
+  <!-- Not connected yet -->
+  <section id="connect" class="hero">
+    <h1>Your task keeper</h1>
+    <p>Connect to see and add tasks.</p>
+    <button class="primary" id="connectBtn">Connect</button>
+    <p class="note" id="connectNote"></p>
+  </section>
+
+  <!-- Connected -->
+  <section id="main" class="hidden">
+    <p class="label">NEXT</p>
+    <div class="next" id="next"></div>
+    <p class="label" id="laterLabel">LATER</p>
+    <ul id="list"></ul>
+  </section>
+</div>
+
+<div class="bar hidden" id="bar">
+  <div class="inner">
+    <span class="chip" id="batt"></span>
+    <button class="ghost" id="beepBtn" title="Play the chime on the device">Beep</button>
+    <button class="primary" id="addBtn">Add task</button>
+  </div>
+</div>
+
+<div id="sheetWrap">
+  <div class="sheet-bg" id="sheetBg"></div>
+  <form class="sheet" id="sheet" autocomplete="off">
+    <div class="inner">
+      <h2>New task</h2>
+      <div class="field">
+        <label for="title">Title <span class="count" id="titleCount"></span></label>
+        <input id="title" maxlength="24" placeholder="Call the dentist" required>
+      </div>
+      <div class="field">
+        <label for="brief">Brief <span class="count" id="briefCount"></span></label>
+        <textarea id="brief" maxlength="80" placeholder="Optional, shows under the title"></textarea>
+      </div>
+      <div class="field">
+        <label>When</label>
+        <div class="row">
+          <input type="date" id="date" required>
+          <input type="time" id="time" required>
+        </div>
+      </div>
+      <div class="quick">
+        <button type="button" class="ghost" data-in="30">In 30 min</button>
+        <button type="button" class="ghost" data-in="60">In 1 hour</button>
+        <button type="button" class="ghost" data-tomorrow="9">Tomorrow 9 AM</button>
+      </div>
+      <p class="error" id="formError"></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="cancelBtn">Cancel</button>
+        <button type="submit" class="primary" id="saveBtn">Add</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ setup */
+
+const SERVICE = "6e2a0001-8a5c-4b1e-9d3f-2c5b7a1e4f00";
+const COMMAND = "6e2a0002-8a5c-4b1e-9d3f-2c5b7a1e4f00";
+const RESPONSE = "6e2a0003-8a5c-4b1e-9d3f-2c5b7a1e4f00";
+const TITLE_MAX = 24;   /* TASK_TITLE_LEN in app/src/tasks.h */
+const BRIEF_MAX = 80;   /* TASK_BRIEF_LEN */
+const TASK_MAX = 16;    /* TASK_MAX */
+const REPLY_TIMEOUT_MS = 6000;
+
+const $ = (id) => document.getElementById(id);
+const MOCK = new URLSearchParams(location.search).has("mock");
+
+/* ------------------------------------------------------------- text rules */
+
+/* The device's font is plain ASCII. Turn smart punctuation into ASCII,
+ * drop "|" (it separates the parts of a command) and anything else. */
+function clean(s, max) {
+  return s
+    .replace(/[‘’‚′]/g, "'")
+    .replace(/[“”„″]/g, '"')
+    .replace(/[–—]/g, "-")
+    .replace(/…/g, "...")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\|/g, "/")
+    .replace(/[^\x20-\x7E]/g, "")
+    .trim()
+    .slice(0, max);
+}
+
+const pad = (n) => String(n).padStart(2, "0");
+const fmtStamp = (d) =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+/* "2026-10-08 16:30" -> Date (local time, as the device uses) */
+function parseStamp(s) {
+  const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)(?::(\d\d))?$/.exec(s);
+  return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) : null;
+}
+
+/* Reply to TASKS -> { now, tasks: [{n, due, title, brief}] } */
+function parseTasks(lines) {
+  const out = { now: null, tasks: [] };
+  for (const line of lines) {
+    if (line.startsWith("NOW|")) {
+      out.now = parseStamp(line.slice(4));
+    } else if (line.startsWith("T|")) {
+      const p = line.split("|");
+      if (p.length >= 5) {
+        out.tasks.push({ n: +p[1], due: parseStamp(p[2]), title: p[3], brief: p.slice(4).join("|") });
+      }
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------ talking to device */
+
+/* Commands go out one at a time; the reply is collected line by line
+ * (one notification per line) until the line that ends it. */
+const endsReply = (line) => /^(OK|ERR)\b/.test(line) || line === "No tasks" ||
+  line.startsWith("BATT ") || line.startsWith("No battery") || line.startsWith("Battery read");
+
+class BleLink {
+  constructor() { this.device = null; this.cmd = null; this.lines = null; this.done = null; }
+
+  get connected() { return !!(this.device && this.device.gatt.connected && this.cmd); }
+
+  async pick() {
+    this.device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE] }, { namePrefix: "Pulsar" }],
+      optionalServices: [SERVICE],
+    });
+    this.device.addEventListener("gattserverdisconnected", () => {
+      this.cmd = null;
+      onLinkChange();
+    });
+  }
+
+  /* Connects (or reconnects after the device hung up on an idle phone). */
+  async open() {
+    if (!this.device) await this.pick();
+    if (this.connected) return;
+    const server = await this.device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    const rsp = await svc.getCharacteristic(RESPONSE);
+    this.cmd = await svc.getCharacteristic(COMMAND);
+    /* The browser may hand back the same object after a reconnect:
+     * listen only once. */
+    if (!rsp._tkListening) rsp.addEventListener("characteristicvaluechanged", (e) => {
+      const line = new TextDecoder().decode(e.target.value);
+      if (!this.lines) return;
+      this.lines.push(line);
+      if (endsReply(line)) this.done();
+    });
+    rsp._tkListening = true;
+    /* Subscribing needs the pairing; the phone asks for the code the
+     * device shows the first time. */
+    await rsp.startNotifications();
+    onLinkChange();
+  }
+
+  async send(text) {
+    await this.open();
+    this.lines = [];
+    const finished = new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("The device didn't answer")), REPLY_TIMEOUT_MS);
+      this.done = () => { clearTimeout(t); resolve(); };
+    });
+    await this.cmd.writeValueWithResponse(new TextEncoder().encode(text));
+    await finished;
+    const lines = this.lines;
+    this.lines = null;
+    return lines;
+  }
+
+  close() { if (this.device && this.device.gatt.connected) this.device.gatt.disconnect(); }
+}
+
+/* A pretend device for ?mock: same commands, same replies. */
+class MockLink {
+  constructor() {
+    const at = (min) => new Date(Date.now() + min * 60000);
+    this.tasks = [
+      { due: at(42), title: "Stand-up", brief: "Bring the battery numbers" },
+      { due: at(185), title: "Call the dentist", brief: "" },
+      { due: at(60 * 20), title: "Order LiPo spares", brief: "350 mAh, JST-PH" },
+    ];
+    this.connected = false;
+  }
+  async open() { await new Promise((r) => setTimeout(r, 400)); this.connected = true; onLinkChange(); }
+  close() { this.connected = false; onLinkChange(); }
+  sorted() { return [...this.tasks].sort((a, b) => a.due - b.due); }
+  async send(text) {
+    if (!this.connected) await this.open();
+    await new Promise((r) => setTimeout(r, 150));
+    const [word, ...rest] = text.split(" ");
+    const arg = rest.join(" ");
+    switch (word.toUpperCase()) {
+      case "TASKS": {
+        const s = this.sorted();
+        return [`NOW|${fmtStamp(new Date())}:00`,
+          ...s.map((t, i) => `T|${i + 1}|${fmtStamp(t.due)}|${t.title}|${t.brief}`), `OK ${s.length}`];
+      }
+      case "ADD": {
+        const [when, title, brief = ""] = arg.split("|");
+        if (this.tasks.length >= TASK_MAX) return [`ERR device is full (${TASK_MAX} tasks)`];
+        this.tasks.push({ due: parseStamp(when), title, brief });
+        return [`OK added: ${title}`];
+      }
+      case "DEL": {
+        const s = this.sorted(), n = +arg;
+        if (!(n >= 1 && n <= s.length)) return [`ERR no task ${arg} (there are ${s.length})`];
+        this.tasks.splice(this.tasks.indexOf(s[n - 1]), 1);
+        return [`OK deleted: ${s[n - 1].title}`];
+      }
+      case "BATT": return ["BATT 3.94 V ~70%, on battery 9h 54m"];
+      case "BEEP": return ["OK beep"];
+      default: return ["ERR unknown command"];
+    }
+  }
+}
+
+const link = MOCK ? new MockLink() : new BleLink();
+
+/* ------------------------------------------------------------------- UI */
+
+let tasks = [];
+let busy = false;
+
+function toast(msg, ms = 2600) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), ms);
+}
+
+function onLinkChange() {
+  const on = link.connected;
+  $("app").classList.toggle("off", !on);
+  if (tasks.length || on) {
+    $("status").textContent = on ? "Connected" : "Asleep · reconnects when needed";
+  }
+}
+
+const DAY = 86400000;
+function dayLabel(d) {
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const diff = Math.floor((d - start) / DAY);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Tomorrow";
+  if (diff > 1 && diff < 7) return d.toLocaleDateString(undefined, { weekday: "long" });
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+const timeLabel = (d) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+function render() {
+  $("connect").classList.add("hidden");
+  $("main").classList.remove("hidden");
+  $("bar").classList.remove("hidden");
+
+  const next = $("next");
+  next.innerHTML = "";
+  const first = tasks[0];
+  next.classList.toggle("empty", !first);
+  if (first) {
+    next.append(
+      el("div", "when", `${dayLabel(first.due)} · ${timeLabel(first.due)}`),
+      el("div", "title", first.title),
+    );
+    if (first.brief) next.append(el("div", "brief", first.brief));
+  } else {
+    next.append(el("div", "title", "Nothing coming up"));
+  }
+
+  const list = $("list");
+  list.innerHTML = "";
+  $("laterLabel").classList.toggle("hidden", tasks.length < 2);
+  tasks.slice(1).forEach((t) => list.append(row(t)));
+  if (first) {
+    const b = delButton(first);
+    b.style.marginTop = "14px";
+    next.append(b);
+  }
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function row(t) {
+  const li = el("li");
+  if (t.due < new Date()) li.classList.add("past");
+  const when = el("div", "when", timeLabel(t.due));
+  when.prepend(el("span", "day", dayLabel(t.due)));
+  const body = el("div", "body");
+  body.append(el("div", "title", t.title));
+  if (t.brief) body.append(el("div", "brief", t.brief));
+  li.append(when, body, delButton(t));
+  return li;
+}
+
+/* Two taps to delete: "Done" then "Delete?". */
+function delButton(t) {
+  const b = el("button", "del", "Done");
+  b.type = "button";
+  b.addEventListener("click", () => {
+    if (!b.classList.contains("confirm")) {
+      b.classList.add("confirm");
+      b.textContent = "Remove?";
+      setTimeout(() => { b.classList.remove("confirm"); b.textContent = "Done"; }, 3000);
+      return;
+    }
+    removeTask(t);
+  });
+  return b;
+}
+
+async function run(fn) {
+  if (busy) return;
+  busy = true;
+  try { await fn(); }
+  catch (e) {
+    if (e && e.name === "NotFoundError") return;   /* picker closed */
+    toast(friendly(e));
+    console.error(e);
+  } finally { busy = false; onLinkChange(); }
+}
+
+function friendly(e) {
+  const m = (e && e.message) || String(e);
+  if (/not supported|bluetooth is not available|undefined/i.test(m) && !navigator.bluetooth)
+    return "This browser can't use Bluetooth. On iPhone, open this page in Bluefy.";
+  if (/auth|encrypt|insufficient/i.test(m)) return "Pair first: enter the code shown on the device.";
+  return m.replace(/^Error: /, "");
+}
+
+async function refresh() {
+  const reply = await link.send("TASKS");
+  tasks = parseTasks(reply).tasks.filter((t) => t.due);
+  render();
+  $("status").textContent = "Connected";
+}
+
+async function refreshBattery() {
+  const [line] = await link.send("BATT");
+  const m = /BATT ([\d.]+) V ~(\d+)%/.exec(line || "");
+  $("batt").textContent = m ? `${m[2]}%` : "";
+  $("batt").title = line || "";
+}
+
+async function removeTask(t) {
+  await run(async () => {
+    /* Numbers can shift if a task finished meanwhile: look it up fresh. */
+    const now = parseTasks(await link.send("TASKS")).tasks;
+    const hit = now.find((x) => x.title === t.title && x.due && +x.due === +t.due);
+    if (!hit) { toast("Already gone"); await refresh(); return; }
+    const [reply] = await link.send(`DEL ${hit.n}`);
+    if (!reply.startsWith("OK")) throw new Error(reply.replace(/^ERR /, ""));
+    toast(`Removed “${t.title}”`);
+    await refresh();
+  });
+}
+
+/* --------------------------------------------------------------- add form */
+
+function openSheet() {
+  $("formError").textContent = "";
+  $("title").value = "";
+  $("brief").value = "";
+  setWhen(new Date(Date.now() + 60 * 60000));
+  counts();
+  document.body.classList.add("open");
+  setTimeout(() => $("title").focus(), 50);
+}
+const closeSheet = () => document.body.classList.remove("open");
+
+function setWhen(d) {
+  d.setSeconds(0, 0);
+  const m = d.getMinutes();
+  if (m % 5) d.setMinutes(m + 5 - (m % 5));  /* round up to 5 minutes */
+  $("date").value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  $("time").value = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function counts() {
+  for (const [id, max] of [["title", TITLE_MAX], ["brief", BRIEF_MAX]]) {
+    const n = $(id).value.length;
+    const c = $(id + "Count");
+    c.textContent = `${n}/${max}`;
+    c.classList.toggle("full", n >= max);
+  }
+}
+
+async function addTask(ev) {
+  ev.preventDefault();
+  const title = clean($("title").value, TITLE_MAX);
+  const brief = clean($("brief").value, BRIEF_MAX);
+  const due = parseStamp(`${$("date").value} ${$("time").value}`);
+  if (!title) return ($("formError").textContent = "Give it a title.");
+  if (!due) return ($("formError").textContent = "Pick a date and time.");
+  if (due < new Date(Date.now() - 60000)) return ($("formError").textContent = "That time has passed.");
+  if (tasks.length >= TASK_MAX) return ($("formError").textContent = `The device holds ${TASK_MAX} tasks.`);
+
+  $("saveBtn").disabled = true;
+  await run(async () => {
+    const [reply] = await link.send(`ADD ${fmtStamp(due)}|${title}${brief ? "|" + brief : ""}`);
+    if (!reply || !reply.startsWith("OK")) throw new Error((reply || "No answer").replace(/^ERR /, ""));
+    closeSheet();
+    toast(`Added “${title}”`);
+    await refresh();
+  });
+  $("saveBtn").disabled = false;
+}
+
+/* ----------------------------------------------------------------- wiring */
+
+$("connectBtn").addEventListener("click", () => run(async () => {
+  if (!MOCK && !navigator.bluetooth) throw new Error("not supported");
+  $("connectBtn").disabled = true;
+  $("status").textContent = "Connecting…";
+  try {
+    await link.open();
+    await refresh();
+    refreshBattery().catch(() => {});
+  } finally {
+    $("connectBtn").disabled = false;
+    if (!link.connected && !tasks.length) $("status").textContent = "Not connected";
+  }
+}));
+$("addBtn").addEventListener("click", openSheet);
+$("cancelBtn").addEventListener("click", closeSheet);
+$("sheetBg").addEventListener("click", closeSheet);
+$("sheet").addEventListener("submit", addTask);
+$("title").addEventListener("input", counts);
+$("brief").addEventListener("input", counts);
+$("beepBtn").addEventListener("click", () => run(async () => { await link.send("BEEP"); toast("Beep sent"); }));
+$("batt").addEventListener("click", () => run(refreshBattery));
+document.querySelectorAll(".quick button").forEach((b) => b.addEventListener("click", () => {
+  const d = new Date();
+  if (b.dataset.in) d.setTime(d.getTime() + b.dataset.in * 60000);
+  else { d.setDate(d.getDate() + 1); d.setHours(+b.dataset.tomorrow, 0, 0, 0); }
+  setWhen(d);
+}));
+
+/* Coming back to the app: refresh the list (reconnects if needed). */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !$("main").classList.contains("hidden")) {
+    run(refresh);
+  }
+});
+
+if (MOCK) $("connectNote").textContent = "Preview mode: a pretend device, nothing is sent.";
+else if (!navigator.bluetooth) $("connectNote").textContent = "On iPhone, open this page in the Bluefy browser (Safari has no Bluetooth for web pages).";
+</script>
+</body>
+</html>

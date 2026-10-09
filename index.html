@@ -149,6 +149,11 @@
   }
   .toast.show { opacity: 1; }
   .hidden { display: none !important; }
+  .debug {
+    position: fixed; left: 8px; right: 8px; top: 8px; max-height: 35vh; overflow: auto; margin: 0;
+    background: rgba(20,21,24,.95); border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+    font: 11px/1.4 var(--mono); color: var(--soft); white-space: pre-wrap; z-index: 10;
+  }
 </style>
 </head>
 <body>
@@ -219,6 +224,7 @@
 </div>
 
 <div class="toast" id="toast" role="status"></div>
+<pre class="debug hidden" id="debug"></pre>
 
 <script>
 "use strict";
@@ -235,6 +241,35 @@ const REPLY_TIMEOUT_MS = 6000;
 
 const $ = (id) => document.getElementById(id);
 const MOCK = new URLSearchParams(location.search).has("mock");
+const DEBUG = new URLSearchParams(location.search).has("debug");
+
+/* ?debug shows each step and every line to and from the device. */
+function debug(msg) {
+  console.log("[tk]", msg);
+  if (!DEBUG) return;
+  const box = $("debug");
+  box.classList.remove("hidden");
+  box.textContent += `${new Date().toLocaleTimeString()}  ${msg}\n`;
+  box.scrollTop = box.scrollHeight;
+}
+
+/* Runs one connection step with a time limit, showing it as the status. */
+async function step(label, ms, fn) {
+  $("status").textContent = label + "…";
+  debug(label);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: no answer after ${ms / 1000} s`)), ms);
+  });
+  try {
+    return await Promise.race([fn(), timeout]);
+  } catch (e) {
+    debug(`${label} failed: ${e.message || e}`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /* ------------------------------------------------------------- text rules */
 
@@ -306,22 +341,26 @@ class BleLink {
   async open() {
     if (!this.device) await this.pick();
     if (this.connected) return;
-    const server = await this.device.gatt.connect();
-    const svc = await server.getPrimaryService(SERVICE);
-    const rsp = await svc.getCharacteristic(RESPONSE);
-    this.cmd = await svc.getCharacteristic(COMMAND);
+    /* Each step has a time limit, so a stuck step says which one it was
+     * instead of leaving the app on "Connecting..." forever. */
+    const server = await step("Connecting", 15000, () => this.device.gatt.connect());
+    const svc = await step("Finding the task service", 10000, () => server.getPrimaryService(SERVICE));
+    const rsp = await step("Reading the service", 10000, () => svc.getCharacteristic(RESPONSE));
+    const cmd = await step("Reading the service", 10000, () => svc.getCharacteristic(COMMAND));
     /* The browser may hand back the same object after a reconnect:
      * listen only once. */
     if (!rsp._tkListening) rsp.addEventListener("characteristicvaluechanged", (e) => {
       const line = new TextDecoder().decode(e.target.value);
+      debug("< " + line);
       if (!this.lines) return;
       this.lines.push(line);
       if (endsReply(line)) this.done();
     });
     rsp._tkListening = true;
-    /* Subscribing needs the pairing; the phone asks for the code the
-     * device shows the first time. */
-    await rsp.startNotifications();
+    /* Subscribing needs the pairing: the first time, the phone asks for
+     * the code the device shows. Give the person time to type it. */
+    await step("Pairing (enter the code shown on the device)", 60000, () => rsp.startNotifications());
+    this.cmd = cmd;
     onLinkChange();
   }
 
@@ -332,6 +371,7 @@ class BleLink {
       const t = setTimeout(() => reject(new Error("The device didn't answer")), REPLY_TIMEOUT_MS);
       this.done = () => { clearTimeout(t); resolve(); };
     });
+    debug("> " + text);
     await this.cmd.writeValueWithResponse(new TextEncoder().encode(text));
     await finished;
     const lines = this.lines;
@@ -491,7 +531,8 @@ async function run(fn) {
   try { await fn(); }
   catch (e) {
     if (e && e.name === "NotFoundError") return;   /* picker closed */
-    toast(friendly(e));
+    toast(friendly(e), 6000);
+    debug("error: " + friendly(e));
     console.error(e);
   } finally { busy = false; onLinkChange(); }
 }
@@ -505,6 +546,8 @@ function friendly(e) {
 }
 
 async function refresh() {
+  if (!link.connected) await link.open();
+  $("status").textContent = "Loading tasks…";
   const reply = await link.send("TASKS");
   tasks = parseTasks(reply).tasks.filter((t) => t.due);
   render();
